@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+notes/
+logs/
+preview.jpg
+
+.run/
