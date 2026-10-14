@@ -109,6 +109,67 @@ class VaultTests(unittest.TestCase):
             self.assertEqual(result['rows'][0]['local'],left)
         self.assertEqual(server.diff_lines('', '')['rows'],[])
 
+    def test_smart_merge_blank_line_and_final_newline(self):
+        local='superpowers\nspce-kit\nopenspec\nkiro\n\n数据治理专项-商店\n- 流通/质量/存储/计算/埋点'
+        remote='superpowers\nspce-kit\nopenspec\nkiro\n1\n数据治理专项-商店\n- 流通/质量/存储/计算/埋点\n'
+        blocks=server.merge_blocks(local,remote)
+        self.assertNotIn('replace',[b['kind'] for b in blocks if '埋点' in b['local']])
+        self.assertEqual(''.join(b['auto_result'] if b['auto_result'] is not None else b['local'] for b in blocks),remote.rstrip('\n'))
+        self.assertTrue(any(b['kind']=='format' for b in blocks))
+        self.assertTrue(any(b['auto_reason']=='本地为空，保留远程内容' for b in blocks))
+        self.assertEqual(''.join(b['local'] for b in blocks),local)
+        self.assertEqual(''.join(b['remote'] for b in blocks),remote)
+        self.assertIsNone(server.merge_blocks('left\n','right\n')[0]['auto_result'])
+
+    def test_modification_times(self):
+        result=self.post('/notes/read',{'path':'修改.md'})
+        self.assertEqual(result['mtime'],(self.remote/'修改.md').stat().st_mtime)
+        for mode,remote in [('directory',str(self.remote)),('http',self.url)]:
+            scan=self.post('/api/scan',{'local':str(self.local),'remote':remote,'mode':mode})
+            row=next(f for f in scan['files'] if f['path']=='修改.md')
+            self.assertEqual(row['local_mtime'],(self.local/'修改.md').stat().st_mtime)
+            result=self.post('/api/merge',{'session':scan['session'],'path':'修改.md','action':'load'})
+            self.assertEqual(result['remote_mtime'],(self.remote/'修改.md').stat().st_mtime)
+
+    def test_directory_exclusions_in_both_modes(self):
+        for root in (self.local,self.remote):
+            for relative in ['附件/a.md','子目录/附件/b.md','归档/旧笔记/c.md','归档/新笔记/d.md']:
+                path=root/relative;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('text')
+        for mode,remote in [('directory',str(self.remote)),('http',self.url)]:
+            result=self.post('/api/scan',{'local':str(self.local),'remote':remote,'mode':mode,'exclude_dirs':['附件','归档/旧笔记']})
+            paths={file['path'] for file in result['files']}
+            self.assertNotIn('附件/a.md',paths)
+            self.assertNotIn('子目录/附件/b.md',paths)
+            self.assertNotIn('归档/旧笔记/c.md',paths)
+            self.assertIn('归档/新笔记/d.md',paths)
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post('/api/delete',{'session':result['session'],'path':'附件/a.md'})
+
+    def test_merge_targets_and_conflict(self):
+        for mode,remote in [('directory',str(self.remote)),('http',self.url)]:
+            for target in ['local','remote','both']:
+                (self.local/'修改.md').write_text('本地')
+                (self.remote/'修改.md').write_text('远程')
+                scan=self.post('/api/scan',{'local':str(self.local),'remote':remote,'mode':mode})
+                request={'session':scan['session'],'path':'修改.md','action':'load'}
+                original=self.post('/api/merge',request)
+                self.assertEqual(''.join(block['local'] for block in original['blocks']),original['local'])
+                self.assertEqual(''.join(block['remote'] for block in original['blocks']),original['remote'])
+                result=self.post('/api/merge',{**request,'action':'save','hashes':original['hashes'],'target':target,'content':'合并\r\n'})
+                self.assertTrue(result['ok'])
+                self.assertEqual(result['status'],'same' if target=='both' else 'modified')
+                for side,root in [('local',self.local),('remote',self.remote)]:
+                    expected='合并\r\n' if target in (side,'both') else ('本地' if side=='local' else '远程')
+                    self.assertEqual((root/'修改.md').read_bytes(),expected.encode())
+                original=self.post('/api/merge',request)
+                (self.remote/'修改.md').write_text('更新')
+                before=(self.local/'修改.md').read_bytes()
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    self.post('/api/merge',{**request,'action':'save','hashes':original['hashes'],'target':'both','content':'旧草稿'})
+                self.assertEqual(error.exception.code,409)
+                self.assertEqual((self.local/'修改.md').read_bytes(),before)
+                self.assertEqual((self.remote/'修改.md').read_text(),'更新')
+
     def test_delete_failure_preserves_session_and_files(self):
         scan=self.post('/api/scan',{'local':str(self.local),'remote':self.url,'mode':'http'})
         with patch('server.remote_call', return_value={'ok':False,'error':'拒绝删除'}) as call:

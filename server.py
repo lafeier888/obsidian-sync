@@ -34,6 +34,33 @@ def diff_lines(local, remote):
                          'remote':right[ri] if ri is not None else None})
     return {'rows':rows, 'counts':counts}
 
+
+def merge_blocks(local, remote):
+    left, right = local.splitlines(keepends=True), remote.splitlines(keepends=True)
+    # Match visible line content; line endings are retained separately in source text.
+    keys = lambda lines: [line.rstrip('\r\n') for line in lines]
+    blocks = []
+    def append(tag,a,b,c,d):
+        l,r = ''.join(left[a:b]), ''.join(right[c:d])
+        kind = 'format' if tag == 'equal' and l != r else tag
+        result,reason = None,None
+        if kind == 'equal': result = l
+        elif kind == 'format': result,reason = l,'仅换行格式不同，保留本地换行'
+        elif not l.strip() and r.strip(): result,reason = r,'本地为空，保留远程内容'
+        elif not r.strip() and l.strip(): result,reason = l,'远程为空，保留本地内容'
+        elif kind in ('insert','delete'): result,reason = l or r,'保留单侧独有内容'
+        blocks.append({'kind':kind,'local':l,'remote':r,'local_start':a+1,'remote_start':c+1,
+                       'auto_result':result,'auto_reason':reason})
+    for tag,a,b,c,d in difflib.SequenceMatcher(None,keys(left),keys(right),autojunk=False).get_opcodes():
+        if tag != 'equal': append(tag,a,b,c,d);continue
+        # Keep truly equal lines outside formatting-only blocks.
+        start=a
+        for index in range(a+1,b+1):
+            if index == b or (left[index] == right[c+index-a]) != (left[start] == right[c+start-a]):
+                append('equal',start,index,c+start-a,c+index-a);start=index
+    return blocks
+
+
 def root_path(value):
     if not isinstance(value, str) or not value.strip():
         raise ValueError('请输入仓库目录')
@@ -62,12 +89,23 @@ def file_path(root, value):
         raise ValueError('路径超出仓库')
     return result, p.as_posix()
 
-def listing(root, ignore_hidden=False):
+def excluded_directory(parts, rules):
+    for rule in rules:
+        segments = tuple(rule.split('/'))
+        if len(segments) == 1 and rule in parts:
+            return True
+        if len(segments) > 1 and tuple(parts[:len(segments)]) == segments:
+            return True
+    return False
+
+
+def listing(root, ignore_hidden=False, exclusions=()):
     files, warnings = [], []
     def error(e):
         warnings.append(str(e))
     for directory, dirs, names in os.walk(root, followlinks=False, onerror=error):
-        dirs[:] = sorted(d for d in dirs if not (Path(directory)/d).is_symlink() and not (ignore_hidden and d.startswith('.')))
+        parts = Path(directory).relative_to(root).parts
+        dirs[:] = sorted(d for d in dirs if not (Path(directory)/d).is_symlink() and not (ignore_hidden and d.startswith('.')) and not excluded_directory((*parts,d), exclusions))
         for name in sorted(names):
             if ignore_hidden and name.startswith('.'):
                 continue
@@ -77,7 +115,7 @@ def listing(root, ignore_hidden=False):
             relative = path.relative_to(root).as_posix()
             try:
                 content = path.read_bytes().decode('utf-8')
-                files.append({'path': relative, 'hash': hashlib.sha256(content.encode('utf-8')).hexdigest()})
+                files.append({'path': relative, 'hash': hashlib.sha256(content.encode('utf-8')).hexdigest(), 'mtime':path.stat().st_mtime})
             except (OSError, UnicodeError) as e:
                 files.append({'path': relative, 'hash': None, 'error': '无法读取 UTF-8 文本：'+str(e)})
     return files, warnings
@@ -154,17 +192,29 @@ class Handler(BaseHTTPRequestHandler):
                     if not path.is_file():
                         if path.exists(): raise ValueError('读取目标必须为普通文件')
                         raise FileNotFoundError('文件不存在')
-                    result = {'content':path.read_bytes().decode('utf-8')}
+                    result = {'content':path.read_bytes().decode('utf-8'), 'mtime':path.stat().st_mtime}
                 self.reply(200, {'ok':True,'path':relative,'filename':path.name,**result}); return
             if not self.server.dashboard:
                 self.reply(404, {'error':'接口不存在'}); return
             if self.path == '/api/scan':
                 local = root_path(data.get('local'))
                 mode = data.get('mode','http')
-                local_files, warnings = listing(local, ignore_hidden=True)
+                exclusions = data.get('exclude_dirs', [])
+                if not isinstance(exclusions, list) or any(not isinstance(rule,str) for rule in exclusions):
+                    raise ValueError('exclude_dirs 必须为目录字符串列表')
+                normalized = []
+                for rule in exclusions:
+                    rule = rule.strip().replace('\\','/').strip('/')
+                    if not rule: continue
+                    if rule.startswith('./'): rule = rule[2:]
+                    if '..' in rule.split('/') or ':' in rule:
+                        raise ValueError('过滤目录必须为相对路径，不支持 .. 或盘符')
+                    normalized.append(rule)
+                exclusions = normalized
+                local_files, warnings = listing(local, ignore_hidden=True, exclusions=exclusions)
                 if mode == 'directory':
                     remote = root_path(data.get('remote'))
-                    remote_files, other_warnings = listing(remote)
+                    remote_files, other_warnings = listing(remote, exclusions=exclusions)
                     warnings += other_warnings
                 elif mode == 'http':
                     remote = data.get('remote')
@@ -177,6 +227,8 @@ class Handler(BaseHTTPRequestHandler):
                 right = {}
                 for f in remote_files:
                     _, relative = file_path(local,f['path'])
+                    if excluded_directory(relative.split('/')[:-1], exclusions):
+                        continue
                     if relative in right: raise ValueError('远程列表包含重复路径')
                     right[relative] = f
                 rows = []
@@ -192,17 +244,60 @@ class Handler(BaseHTTPRequestHandler):
                             text = remote_call(remote,'/notes/read',{'path':p})['content']
                             remote_hash = hashlib.sha256(text.encode()).hexdigest()
                         status = 'same' if a['hash'] == remote_hash else 'modified'
-                    rows.append({'path':p,'status':status,'local':a is not None,'remote':b is not None,'error':error})
+                    rows.append({'path':p,'status':status,'local':a is not None,'remote':b is not None,'error':error,'local_mtime':(a or {}).get('mtime'),'remote_mtime':(b or {}).get('mtime',(b or {}).get('modified_at'))})
                 import secrets
                 token = secrets.token_urlsafe(24)
                 with lock:
                     if len(sessions) >= 30: sessions.pop(next(iter(sessions)))
                     sessions[token] = (local,remote,mode,set(left),set(right))
                 self.reply(200, {'session':token,'files':rows,'warnings':warnings}); return
-            if self.path in ('/api/read', '/api/sync', '/api/delete', '/api/diff'):
+            if self.path in ('/api/read', '/api/sync', '/api/delete', '/api/diff', '/api/merge'):
                 with lock: session = sessions.get(data.get('session'))
                 if not session: raise ValueError('扫描已过期，请重新扫描')
                 local,remote,mode,left,right = session
+                if self.path == '/api/merge':
+                    path = data.get('path')
+                    if path not in left or path not in right:
+                        raise ValueError('合并需要本地和远程均存在此文件')
+                    local_file, relative = file_path(local, path)
+                    local_content = local_file.read_bytes().decode('utf-8')
+                    if mode == 'http':
+                        remote_result = remote_call(remote, '/notes/read', {'path':relative})
+                        remote_content = remote_result.get('content')
+                        remote_mtime = remote_result.get('mtime',remote_result.get('modified_at'))
+                        if not isinstance(remote_content, str): raise ValueError('远程未返回有效内容')
+                    else:
+                        remote_file, _ = file_path(remote, relative)
+                        remote_content = remote_file.read_bytes().decode('utf-8')
+                        remote_mtime = remote_file.stat().st_mtime
+                    hashes = {side:hashlib.sha256(text.encode('utf-8')).hexdigest() for side,text in [('local',local_content),('remote',remote_content)]}
+                    if data.get('action') == 'load':
+                        self.reply(200, {'local':local_content, 'remote':remote_content, 'hashes':hashes,
+                                         'blocks':merge_blocks(local_content,remote_content),'local_mtime':local_file.stat().st_mtime,'remote_mtime':remote_mtime})
+                        return
+                    if data.get('action') != 'save': raise ValueError('无效的合并操作')
+                    content, target = data.get('content'), data.get('target')
+                    if not isinstance(content,str) or target not in ('local','remote','both'):
+                        raise ValueError('需要文本 content 和 local/remote/both 目标')
+                    if data.get('hashes') != hashes:
+                        self.reply(409, {'error':'两端内容在合并期间发生变化。请重新载入原文后再保存；编辑草稿已保留。'})
+                        return
+                    saved = []
+                    try:
+                        if target in ('remote','both'):
+                            if mode == 'http':
+                                result = remote_call(remote, '/notes/write', {'path':relative,'content':content})
+                                if result.get('ok') is not True: raise ValueError(result.get('error') or '远程未确认写入成功')
+                            else: remote_file.write_bytes(content.encode('utf-8'))
+                            saved.append('remote');remote_content = content
+                        if target in ('local','both'):
+                            local_file.write_bytes(content.encode('utf-8'))
+                            saved.append('local');local_content = content
+                    except (OSError,ValueError) as error:
+                        self.reply(200, {'ok':False,'saved':saved,'error':str(error),'status':'same' if local_content==remote_content else 'modified'})
+                        return
+                    self.reply(200, {'ok':True,'saved':saved,'status':'same' if local_content==remote_content else 'modified'})
+                    return
                 if self.path == '/api/diff':
                     path = data.get('path')
                     if path not in left or path not in right:
@@ -275,11 +370,14 @@ class Handler(BaseHTTPRequestHandler):
                 path = data.get('path')
                 if path not in (left if side=='local' else right): raise FileNotFoundError('文件不存在')
                 if side == 'remote' and mode == 'http':
-                    content = remote_call(remote,'/notes/read',{'path':path})['content']
+                    result = remote_call(remote,'/notes/read',{'path':path})
+                    content = result['content']
+                    mtime = result.get('mtime',result.get('modified_at'))
                 else:
                     file, _ = file_path(local if side=='local' else remote,path)
                     content = file.read_bytes().decode('utf-8')
-                self.reply(200, {'content':content}); return
+                    mtime = file.stat().st_mtime
+                self.reply(200, {'content':content,'mtime':mtime}); return
             self.reply(404, {'error':'接口不存在'})
         except FileNotFoundError:
             self.reply(404, {'error':'文件或仓库不存在'})
